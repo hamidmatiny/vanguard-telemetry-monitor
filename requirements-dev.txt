@@ -1,0 +1,4 @@
+# Development and test dependencies (not shipped in production Docker image)
+
+pytest==8.3.4
+pytest-cov==6.0.0

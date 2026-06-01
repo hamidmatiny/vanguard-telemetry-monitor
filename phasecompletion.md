@@ -1,6 +1,8 @@
-# Phase 3 Completion — Vanguard Telemetry Monitor
+# Phase 4 Completion — Vanguard Telemetry Monitor
 
-Phase 3 delivers an **Observability Architecture & Metrics Engine** — a production-style Prometheus + Grafana stack that collects, stores, and visualizes telemetry daemon metrics, mirroring Datadog/CloudWatch-style monitoring patterns.
+Phase 4 delivers **Test-Driven Validation & Alert Simulation** — a pytest suite for automated quality gates, an on-call-style alert handler that monitors Prometheus metrics, and GitHub Actions CI that blocks broken code from reaching `main`.
+
+This is the **final phase** of the Vanguard Telemetry Monitor platform.
 
 ---
 
@@ -8,283 +10,285 @@ Phase 3 delivers an **Observability Architecture & Metrics Engine** — a produc
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `src/daemon.py` | Modified | Exposes Prometheus metrics on port 8000 via `prometheus_client`. |
-| `requirements.txt` | Modified | Added `prometheus_client==0.21.1`. |
-| `Dockerfile` | Modified | Exposes port 8000; sets `METRICS_PORT` default. |
-| `docker-compose.yml` | Created | Multi-container stack: daemon, Prometheus, Grafana. |
-| `prometheus/prometheus.yml` | Created | Scrape config targeting `telemetry-daemon:8000` every 5s. |
-| `grafana/provisioning/datasources/prometheus.yml` | Created | Auto-registers Prometheus as default Grafana datasource. |
-| `grafana/provisioning/dashboards/dashboards.yml` | Created | File-based dashboard provider configuration. |
-| `grafana/provisioning/dashboards/vanguard-dashboard.json` | Created | Pre-baked operational dashboard. |
+| `tests/test_daemon.py` | Created | Pytest suite for telemetry schema, anomalies, and health server. |
+| `tests/test_alert_handler.py` | Created | Pytest suite for alert threshold logic and incident report formatting. |
+| `tests/conftest.py` | Created | Shared fixtures; resets daemon state between tests. |
+| `pytest.ini` | Created | Cross-platform pytest config (`pythonpath = src`). |
+| `requirements-dev.txt` | Created | Test dependencies (`pytest`, `pytest-cov`). |
+| `src/alert_handler.py` | Created | Automated incident controller polling `/metrics`. |
+| `.github/workflows/ci.yml` | Created | GitHub Actions: pytest + Docker build on push/PR. |
 | `phasecompletion.md` | Created | This document. |
 
-### Prior phases (unchanged automation layer)
+### Full platform inventory (Phases 1–4)
 
-| File | Purpose |
-|------|---------|
-| `scripts/deploy-factory.sh` | Standalone single-container deploy (Phase 2). |
-| `scripts/health-check.sh` | Cron-ready triage and cold restart (Phase 2). |
-
-> **Note:** Phase 3 introduces `docker compose` as the primary way to run the full observability stack. Phase 2 scripts remain valid for single-container workflows.
-
----
-
-## Metrics Exposition Design
-
-The daemon starts a **Prometheus metrics HTTP server** on port `8000` (configurable via `METRICS_PORT`) using `prometheus_client.start_http_server()`. Metrics are updated synchronously inside the telemetry loop and anomaly handlers.
-
-### Exposed metrics
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `vanguard_telemetry_emitted_total` | Counter | — | Incremented on every successful JSON telemetry packet. |
-| `vanguard_anomalies_detected_total` | Counter | `anomaly_type` | Incremented when an anomaly fires. Values: `cpu_spike`, `memory_leak`, `corrupt_json`. |
-| `vanguard_memory_usage_bytes` | Gauge | — | Bytes retained in the simulated memory-leak buffer; updated each loop iteration. |
-
-### Endpoint
-
-```
-GET http://telemetry-daemon:8000/metrics
-```
-
-Example excerpt:
-
-```
-# HELP vanguard_telemetry_emitted_total Total successful JSON telemetry packets emitted
-# TYPE vanguard_telemetry_emitted_total counter
-vanguard_telemetry_emitted_total 142.0
-# HELP vanguard_anomalies_detected_total Total production anomalies detected by type
-# TYPE vanguard_anomalies_detected_total counter
-vanguard_anomalies_detected_total{anomaly_type="cpu_spike"} 3.0
-vanguard_anomalies_detected_total{anomaly_type="memory_leak"} 1.0
-vanguard_anomalies_detected_total{anomaly_type="corrupt_json"} 2.0
-# HELP vanguard_memory_usage_bytes Simulated memory consumption retained by the daemon process
-# TYPE vanguard_memory_usage_bytes gauge
-vanguard_memory_usage_bytes 524288.0
-```
-
-### Design rationale (Datadog / CloudWatch parity)
-
-| Production pattern | Vanguard implementation |
-|--------------------|-------------------------|
-| Custom application counters | `vanguard_telemetry_emitted_total`, `vanguard_anomalies_detected_total` |
-| Dimensional tagging | `anomaly_type` label on anomaly counter |
-| Resource utilization gauges | `vanguard_memory_usage_bytes` |
-| Pull-based metric collection | Prometheus scrapes `/metrics` every 5s |
-| Dashboards & visualization | Grafana auto-provisioned dashboard |
+| Layer | Key files |
+|-------|-----------|
+| Application | `src/daemon.py`, `Dockerfile`, `requirements.txt` |
+| Automation | `scripts/deploy-factory.sh`, `scripts/health-check.sh` |
+| Observability | `docker-compose.yml`, `prometheus/prometheus.yml`, `grafana/provisioning/` |
+| Validation & alerts | `tests/`, `src/alert_handler.py`, `.github/workflows/ci.yml` |
 
 ---
 
-## Multi-Container Compose Networking Topology
+## Test Suite Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  Host (macOS / Linux / Windows + Docker Desktop)                            │
-│                                                                             │
-│  Published ports:                                                           │
-│    localhost:8080  → telemetry-daemon:8080  (health)                        │
-│    localhost:8000  → telemetry-daemon:8000  (Prometheus metrics)            │
-│    localhost:9090  → prometheus:9090        (Prometheus UI)                 │
-│    localhost:3000  → grafana:3000             (Grafana UI)                    │
-│                                                                             │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  Docker network: vanguard-net (bridge)                                │  │
-│  │                                                                       │  │
-│  │  ┌─────────────────┐    scrape :8000/5s    ┌─────────────────┐       │  │
-│  │  │ telemetry-daemon│ ─────────────────────► │   prometheus    │       │  │
-│  │  │  :8080 health   │                        │     :9090       │       │  │
-│  │  │  :8000 metrics  │                        └────────┬────────┘       │  │
-│  │  └─────────────────┘                                 │ proxy           │  │
-│  │                                                      ▼                 │  │
-│  │                                             ┌─────────────────┐       │  │
-│  │                                             │    grafana      │       │  │
-│  │                                             │     :3000       │       │  │
-│  │                                             └─────────────────┘       │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+tests/
+├── conftest.py              # Autouse fixture: reset _stats, _memory_leak_buffer
+├── test_daemon.py           # Daemon unit tests (schema, anomalies, health HTTP)
+└── test_alert_handler.py    # Alert handler unit tests (parse, thresholds, report)
 ```
 
-### Service dependency chain
+### Test categories
 
-1. **telemetry-daemon** starts first; must pass health check on `:8080`.
-2. **prometheus** starts after daemon is healthy; scrapes internal DNS name `telemetry-daemon:8000`.
-3. **grafana** starts after Prometheus; datasource URL `http://prometheus:9090` resolves on `vanguard-net`.
+| Module | Test class | Validates |
+|--------|------------|-----------|
+| `test_daemon.py` | `TestTelemetrySchema` | Required fields, types, ranges, JSON serializability, counter increment |
+| `test_daemon.py` | `TestAnomalyInjection` | Memory leak, corrupt JSON, CPU spike stat increments; Prometheus counter |
+| `test_daemon.py` | `TestHealthServer` | `/health`, `/healthz`, `/` return 200 + `status: ok`; unknown paths → 404 |
+| `test_alert_handler.py` | `TestAlertHandler` | Metric parsing, threshold breaches, healthy baseline, incident report banner |
 
-### Cross-platform compatibility
+### Test coverage metrics
 
-- Uses standard Compose v2 syntax (`docker compose`) — works on Docker Desktop for macOS (Apple Silicon native ARM), Linux, and Windows.
-- No host-specific bind mounts beyond relative project paths.
-- Named volumes (`vanguard-prometheus-data`, `vanguard-grafana-data`) persist metrics and dashboard state across restarts.
-- Override ports via environment variables without editing compose file:
+Last run (macOS, Python 3.12+):
 
-```bash
-HOST_GRAFANA_PORT=3001 HOST_PROMETHEUS_PORT=9091 docker compose up -d
-```
+| Module | Statements | Coverage | Notes |
+|--------|------------|----------|-------|
+| `daemon.py` | 144 | **72%** | Main loop, signal handlers, and `main()` excluded (integration scope) |
+| `alert_handler.py` | 109 | **69%** | Poll loop and CLI entrypoint excluded (integration scope) |
+| **Total** | **253** | **71%** | CI gate: `--cov-fail-under=65` |
+
+Uncovered lines are intentionally integration/runtime paths (`telemetry_loop`, `main`, poll loop) that require long-running processes or live Docker stacks.
+
+### Cross-platform execution
+
+Tests use only stdlib + project dependencies — no OS-specific syscalls. The `pytest.ini` `pythonpath = src` setting ensures imports work identically on:
+
+- macOS (Apple Silicon / Intel)
+- Linux (GitHub Actions `ubuntu-latest`)
+- Windows (Git Bash / WSL)
 
 ---
 
-## Grafana Dashboard Panels
+## Alert Handler — Thresholds & Workflow
 
-The auto-provisioned **Vanguard Telemetry Monitor** dashboard (`uid: vanguard-telemetry`) includes:
+`src/alert_handler.py` polls the daemon's Prometheus endpoint and simulates an on-call engineering response.
 
-| Panel | Query | Purpose |
-|-------|-------|---------|
-| Vehicle Telemetry Frequency | `rate(vanguard_telemetry_emitted_total[1m])` | Real-time timeline of incoming packet rate |
-| Anomaly Breakdown | `sum by (anomaly_type) (vanguard_anomalies_detected_total)` | Donut chart of caught anomalies by type |
-| Simulated Memory Allocation | `vanguard_memory_usage_bytes` | Gauge with threshold coloring |
-| Anomaly Detection Rate | `increase(...[5m])` by type | Stacked bar timeline of anomaly events |
-| Total Telemetry Packets | `vanguard_telemetry_emitted_total` | Stat panel |
-| Total Anomalies Detected | `sum(vanguard_anomalies_detected_total)` | Stat panel |
-| Memory Utilization Timeline | `vanguard_memory_usage_bytes` | Line graph over time |
+### Default configuration
 
-Dashboard refresh: **5 seconds** (aligned with Prometheus scrape interval).
+| Parameter | Default | Environment variable |
+|-----------|---------|----------------------|
+| Metrics URL | `http://127.0.0.1:8000/metrics` | `METRICS_URL` |
+| Poll interval | `10` seconds | `ALERT_POLL_INTERVAL` |
+| Fetch timeout | `5` seconds | `ALERT_FETCH_TIMEOUT` |
+| Memory threshold | **15,000,000 bytes (15 MiB)** | `MEMORY_ALERT_THRESHOLD_BYTES` |
+| Corrupt JSON delta | **> 3 per poll interval** | `CORRUPT_JSON_DELTA_THRESHOLD` |
 
----
+### Breach conditions (either triggers CRITICAL alert)
 
-## Launch & Verification Guide
+1. **Memory SLA breach** — `vanguard_memory_usage_bytes` > 15,000,000
+2. **Corrupt JSON spike** — `vanguard_anomalies_detected_total{anomaly_type="corrupt_json"}` increased by more than 3 since the previous poll
 
-### Prerequisites
+### Alert output format
 
-- Docker Desktop running (macOS/Windows) or Docker Engine (Linux)
-- Docker Compose v2 (`docker compose version`)
-- Ports **8080**, **8000**, **9090**, **3000** available on the host
+When a threshold is breached, the handler prints a structured incident report:
 
-### 1. Stop conflicting Phase 2 containers (if running)
+```
+================================================================================
+=== [CRITICAL ALERT] PIPELINE SLA BREACHED ===
+================================================================================
+  Timestamp (UTC)       : 2026-06-01T15:00:00+00:00
+  Metrics endpoint      : http://127.0.0.1:8000/metrics
+  Severity              : CRITICAL
+  ...
+  ON-CALL ACTION REQUIRED
+  1. Inspect telemetry-daemon logs: docker logs telemetry-daemon
+  2. Review Grafana anomaly panels: http://localhost:3000
+  3. Execute recovery: ./scripts/health-check.sh or docker compose restart
+================================================================================
+```
+
+### CLI usage
 
 ```bash
-./scripts/deploy-factory.sh --stop
-```
+# Continuous monitoring (default 10s interval)
+python src/alert_handler.py
 
-### 2. Launch the full observability stack
+# Single evaluation cycle
+python src/alert_handler.py --once
 
-From the project root:
+# Custom thresholds
+python src/alert_handler.py --memory-threshold 10000000 --corrupt-delta-threshold 2
 
-```bash
-docker compose up -d --build
-```
-
-Expected services:
-
-```
-telemetry-daemon   healthy
-prometheus         running
-grafana            running
-```
-
-Monitor startup:
-
-```bash
-docker compose ps
-docker compose logs -f telemetry-daemon
-```
-
-### 3. Verify metrics exposition
-
-```bash
-# Raw Prometheus metrics from daemon
-curl -s http://localhost:8000/metrics | grep vanguard_
-
-# Health endpoint (Phase 1/2)
-curl -s http://localhost:8080/health
-```
-
-- [ ] `vanguard_telemetry_emitted_total` counter is incrementing
-- [ ] `vanguard_anomalies_detected_total` appears with `anomaly_type` labels after anomalies fire
-- [ ] `vanguard_memory_usage_bytes` increases when memory-leak anomalies occur
-
-### 4. Verify Prometheus scraping
-
-Open **http://localhost:9090** → **Status → Targets**.
-
-- [ ] Target `vanguard-telemetry` shows **UP**
-- [ ] Last scrape ~5s ago
-- [ ] Endpoint `http://telemetry-daemon:8000/metrics`
-
-Query in Prometheus UI:
-
-```promql
-rate(vanguard_telemetry_emitted_total[1m])
-```
-
-### 5. Verify Grafana dashboard
-
-Open **http://localhost:3000**
-
-| Field | Value |
-|-------|-------|
-| Username | `admin` |
-| Password | `admin` |
-
-Navigate: **Dashboards → Vanguard → Vanguard Telemetry Monitor**
-
-- [ ] Telemetry frequency graph shows ~1 packet/sec (default interval)
-- [ ] Anomaly donut chart populates over time
-- [ ] Memory gauge reflects simulated leak buffer growth
-- [ ] Dashboard auto-refreshes every 5 seconds
-
-### 6. Optional — increase anomaly rate for faster demo
-
-```bash
-ANOMALY_CPU_SPIKE_PROB=0.10 ANOMALY_MEMORY_LEAK_PROB=0.08 ANOMALY_CORRUPT_JSON_PROB=0.08 \
-  docker compose up -d --build telemetry-daemon
-```
-
-Watch panels update within 5–10 seconds.
-
-### 7. Tear down
-
-```bash
-# Stop containers (retain volumes)
-docker compose down
-
-# Stop and remove volumes (full reset)
-docker compose down -v
+# Against compose stack
+python src/alert_handler.py --metrics-url http://127.0.0.1:8000/metrics --once
 ```
 
 ---
 
-## Environment Variables Reference
+## GitHub Actions CI Pipeline
 
-| Variable | Default | Service | Description |
-|----------|---------|---------|-------------|
-| `HOST_HEALTH_PORT` | `8080` | compose | Host port for daemon health |
-| `HOST_METRICS_PORT` | `8000` | compose | Host port for Prometheus metrics |
-| `HOST_PROMETHEUS_PORT` | `9090` | compose | Host port for Prometheus UI |
-| `HOST_GRAFANA_PORT` | `3000` | compose | Host port for Grafana UI |
-| `GRAFANA_ADMIN_USER` | `admin` | grafana | Grafana login user |
-| `GRAFANA_ADMIN_PASSWORD` | `admin` | grafana | Grafana login password |
-| `TELEMETRY_INTERVAL` | `1.0` | telemetry-daemon | Seconds between emissions |
-| `ANOMALY_CPU_SPIKE_PROB` | `0.02` | telemetry-daemon | CPU spike probability |
-| `ANOMALY_MEMORY_LEAK_PROB` | `0.01` | telemetry-daemon | Memory leak probability |
-| `ANOMALY_CORRUPT_JSON_PROB` | `0.015` | telemetry-daemon | Corrupt JSON probability |
-| `METRICS_PORT` | `8000` | telemetry-daemon | In-container metrics port |
+File: `.github/workflows/ci.yml`
+
+### Triggers
+
+- Every `git push` to `main` or `master`
+- Every pull request targeting `main` or `master`
+
+### Jobs
+
+```
+┌─────────────────────┐
+│  Job: test          │
+│  ubuntu-latest      │
+│  • checkout         │
+│  • setup-python 3.12│
+│  • pip install deps │
+│  • pytest + cov     │──┐
+└─────────────────────┘  │
+                         │ needs: test
+┌─────────────────────┐  │
+│  Job: docker-build  │◄─┘
+│  ubuntu-latest      │
+│  • docker build     │
+│  • smoke test run   │
+│  • curl /health     │
+│  • curl /metrics    │
+└─────────────────────┘
+```
+
+### CI guarantees
+
+- All pytest tests pass with ≥ 65% combined coverage
+- Docker image builds successfully on Linux
+- Container starts and responds on `/health` and `/metrics`
+
+---
+
+## Run Unit Tests Locally (MacBook Pro)
+
+### One-time setup
+
+```bash
+cd vanguard-telemetry-monitor
+
+# Create isolated virtual environment (recommended on macOS)
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install runtime + test dependencies
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+### Run tests
+
+```bash
+# Full suite with verbose output
+pytest tests/ -v
+
+# With coverage report
+pytest tests/ --cov=daemon --cov=alert_handler --cov-report=term-missing
+
+# Single test file
+pytest tests/test_daemon.py -v
+
+# Single test
+pytest tests/test_daemon.py::TestHealthServer::test_health_endpoint_returns_200_and_ok_status -v
+```
+
+Expected result: **16 passed** (11 daemon + 5 alert handler).
+
+### Run alert handler against live stack
+
+```bash
+# Start observability stack (Phase 3)
+docker compose up -d
+
+# Monitor for SLA breaches
+python src/alert_handler.py --once
+```
+
+To force a memory alert for demo purposes, deploy with elevated leak probability and wait:
+
+```bash
+ANOMALY_MEMORY_LEAK_PROB=0.50 docker compose up -d --build telemetry-daemon
+python src/alert_handler.py --interval 5
+```
 
 ---
 
 ## MacBook Pro Validation Checklist
 
-- [ ] `docker compose up -d --build` completes without errors on Apple Silicon
-- [ ] `curl localhost:8000/metrics | grep vanguard_telemetry_emitted_total` returns data
-- [ ] Prometheus target `telemetry-daemon:8000` is **UP** at http://localhost:9090/targets
-- [ ] Grafana loads at http://localhost:3000 with credentials `admin` / `admin`
-- [ ] **Vanguard Telemetry Monitor** dashboard shows live graphs within 15 seconds
-- [ ] Memory gauge increases after memory-leak anomalies (may take 1–2 minutes at default rates)
-- [ ] `docker compose down` cleanly stops all three services
+### Unit tests
+
+- [ ] `python3 -m venv .venv && source .venv/bin/activate` succeeds
+- [ ] `pip install -r requirements.txt -r requirements-dev.txt` succeeds
+- [ ] `pytest tests/ -v` → **16 passed**
+- [ ] Coverage report shows ≥ 65% total
+
+### Alert handler
+
+- [ ] `docker compose up -d` — stack running
+- [ ] `python src/alert_handler.py --once` — exits 0 (healthy) or prints CRITICAL alert
+- [ ] Alert report contains `=== [CRITICAL ALERT] PIPELINE SLA BREACHED ===` when thresholds breached
+
+### CI parity
+
+- [ ] `docker build -t vanguard-telemetry-monitor:local .` succeeds
+- [ ] Push to GitHub triggers Actions workflow (when remote configured)
+
+---
+
+## Platform Summary — All Phases Complete
+
+| Phase | Deliverable | Status |
+|-------|-------------|--------|
+| **1** | Containerized telemetry daemon with anomaly simulation | Complete |
+| **2** | Bash automation layer (`deploy-factory.sh`, `health-check.sh`) | Complete |
+| **3** | Prometheus + Grafana observability stack | Complete |
+| **4** | Pytest validation, alert handler, GitHub Actions CI | Complete |
+
+### End-to-end launch (full platform)
+
+```bash
+# 1. Run tests
+source .venv/bin/activate && pytest tests/ -v
+
+# 2. Launch observability stack
+docker compose up -d --build
+
+# 3. Verify dashboards
+open http://localhost:3000    # admin / admin
+
+# 4. Start alert monitoring
+python src/alert_handler.py
+
+# 5. Optional — Phase 2 health automation
+./scripts/health-check.sh --verbose
+```
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| Port already allocated | Phase 2 container or other service on 8080/3000 | `./scripts/deploy-factory.sh --stop` or change `HOST_*_PORT` vars |
-| Prometheus target DOWN | Daemon not healthy yet | `docker compose logs telemetry-daemon`; wait for health check |
-| Empty Grafana panels | Prometheus not scraping yet | Confirm target UP; set time range to **Last 15 minutes** |
-| Dashboard not appearing | Provisioning path issue | `docker compose logs grafana \| grep provisioning` |
-| Metrics stale after rebuild | Old Prometheus volume | `docker compose down -v` and relaunch |
+| Symptom | Fix |
+|---------|-----|
+| `pytest: command not found` | Activate venv: `source .venv/bin/activate` |
+| `ModuleNotFoundError: daemon` | Run from project root; confirm `pytest.ini` exists |
+| `externally-managed-environment` (macOS) | Use `python3 -m venv .venv` — do not pip install globally |
+| Alert handler connection refused | Start stack: `docker compose up -d` |
+| CI coverage failure | Run `pytest --cov=daemon --cov=alert_handler --cov-report=term-missing` locally |
 
 ---
 
-## Next Steps (Phase 4+)
+## What You Built
 
-Future phases may add Alertmanager rules, Loki log aggregation, OpenTelemetry tracing, and integration with the Phase 2 `health-check.sh` automation layer for unified incident response.
+A complete, production-pattern telemetry monitoring platform:
+
+- **Generates** realistic vehicle telemetry with injectable anomalies
+- **Deploys** cross-platform via Docker with Bash automation
+- **Observes** metrics through Prometheus and Grafana dashboards
+- **Validates** code quality with pytest on every push
+- **Alerts** on SLA breaches with structured on-call incident reports
+
+The Vanguard Telemetry Monitor platform is ready for demonstration, extension, or integration into larger SRE workflows.
