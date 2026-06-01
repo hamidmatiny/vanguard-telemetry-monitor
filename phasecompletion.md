@@ -1,169 +1,290 @@
-# Phase 1 Completion — Vanguard Telemetry Monitor
+# Phase 3 Completion — Vanguard Telemetry Monitor
 
-Phase 1 delivers a containerized Linux telemetry simulation daemon that runs identically on macOS (Apple Silicon and Intel), Windows, and Linux hosts via Docker.
+Phase 3 delivers an **Observability Architecture & Metrics Engine** — a production-style Prometheus + Grafana stack that collects, stores, and visualizes telemetry daemon metrics, mirroring Datadog/CloudWatch-style monitoring patterns.
 
 ---
 
-## Files Created
+## Files Created / Modified
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `src/daemon.py` | Modified | Exposes Prometheus metrics on port 8000 via `prometheus_client`. |
+| `requirements.txt` | Modified | Added `prometheus_client==0.21.1`. |
+| `Dockerfile` | Modified | Exposes port 8000; sets `METRICS_PORT` default. |
+| `docker-compose.yml` | Created | Multi-container stack: daemon, Prometheus, Grafana. |
+| `prometheus/prometheus.yml` | Created | Scrape config targeting `telemetry-daemon:8000` every 5s. |
+| `grafana/provisioning/datasources/prometheus.yml` | Created | Auto-registers Prometheus as default Grafana datasource. |
+| `grafana/provisioning/dashboards/dashboards.yml` | Created | File-based dashboard provider configuration. |
+| `grafana/provisioning/dashboards/vanguard-dashboard.json` | Created | Pre-baked operational dashboard. |
+| `phasecompletion.md` | Created | This document. |
+
+### Prior phases (unchanged automation layer)
 
 | File | Purpose |
 |------|---------|
-| `src/daemon.py` | Background Python service that emits structured vehicle telemetry JSON logs and randomly injects production-like anomalies (CPU spikes, memory leaks, corrupt JSON). |
-| `Dockerfile` | Multi-stage Alpine-based image with a non-root runtime user, health checks, and cross-platform compatibility. |
-| `requirements.txt` | Pinned Python dependency (`python-json-logger`) for structured JSON logging to stdout. |
-| `.dockerignore` | Excludes VCS metadata, virtualenvs, and documentation from the build context for faster, smaller builds. |
-| `phasecompletion.md` | This document — build/run instructions and architecture notes for Phase 1. |
+| `scripts/deploy-factory.sh` | Standalone single-container deploy (Phase 2). |
+| `scripts/health-check.sh` | Cron-ready triage and cold restart (Phase 2). |
+
+> **Note:** Phase 3 introduces `docker compose` as the primary way to run the full observability stack. Phase 2 scripts remain valid for single-container workflows.
 
 ---
 
-## Daemon Behavior
+## Metrics Exposition Design
 
-### Normal telemetry payload
+The daemon starts a **Prometheus metrics HTTP server** on port `8000` (configurable via `METRICS_PORT`) using `prometheus_client.start_http_server()`. Metrics are updated synchronously inside the telemetry loop and anomaly handlers.
 
-Each interval (default: 1 second), the daemon emits a log line containing:
+### Exposed metrics
 
-```json
-{
-  "vehicle_id": "VH-003",
-  "timestamp": "2026-06-01T12:00:00.123456+00:00",
-  "speed": 87.4,
-  "fuel_level": 62.1,
-  "sensor_status": "ok"
-}
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `vanguard_telemetry_emitted_total` | Counter | — | Incremented on every successful JSON telemetry packet. |
+| `vanguard_anomalies_detected_total` | Counter | `anomaly_type` | Incremented when an anomaly fires. Values: `cpu_spike`, `memory_leak`, `corrupt_json`. |
+| `vanguard_memory_usage_bytes` | Gauge | — | Bytes retained in the simulated memory-leak buffer; updated each loop iteration. |
+
+### Endpoint
+
+```
+GET http://telemetry-daemon:8000/metrics
 ```
 
-### Simulated anomalies
+Example excerpt:
 
-| Anomaly | Default probability | Behavior |
-|---------|--------------------|----------|
-| **CPU spike** | 2% | Spawns 4 worker threads doing CPU-bound work for ~3 seconds, simulating ~90% CPU utilization. |
-| **Memory leak** | 1% | Retains 512 KB chunks in an in-process buffer that is never released. |
-| **Corrupt JSON** | 1.5% | Writes malformed JSON directly to stdout (truncated braces, invalid syntax, wrong types). |
+```
+# HELP vanguard_telemetry_emitted_total Total successful JSON telemetry packets emitted
+# TYPE vanguard_telemetry_emitted_total counter
+vanguard_telemetry_emitted_total 142.0
+# HELP vanguard_anomalies_detected_total Total production anomalies detected by type
+# TYPE vanguard_anomalies_detected_total counter
+vanguard_anomalies_detected_total{anomaly_type="cpu_spike"} 3.0
+vanguard_anomalies_detected_total{anomaly_type="memory_leak"} 1.0
+vanguard_anomalies_detected_total{anomaly_type="corrupt_json"} 2.0
+# HELP vanguard_memory_usage_bytes Simulated memory consumption retained by the daemon process
+# TYPE vanguard_memory_usage_bytes gauge
+vanguard_memory_usage_bytes 524288.0
+```
 
-All probabilities and timings are configurable via environment variables (see below).
+### Design rationale (Datadog / CloudWatch parity)
 
-### Health endpoint
-
-A lightweight HTTP server listens on port **8080** (`/health`, `/healthz`, `/`) and returns daemon statistics. This supports Docker `HEALTHCHECK` and future Kubernetes liveness probes.
+| Production pattern | Vanguard implementation |
+|--------------------|-------------------------|
+| Custom application counters | `vanguard_telemetry_emitted_total`, `vanguard_anomalies_detected_total` |
+| Dimensional tagging | `anomaly_type` label on anomaly counter |
+| Resource utilization gauges | `vanguard_memory_usage_bytes` |
+| Pull-based metric collection | Prometheus scrapes `/metrics` every 5s |
+| Dashboards & visualization | Grafana auto-provisioned dashboard |
 
 ---
 
-## Multi-Stage Dockerfile — Cross-Platform Optimization
+## Multi-Container Compose Networking Topology
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 1: builder (python:3.12-alpine)                      │
-│  • Installs gcc/build-base (compile toolchain)              │
-│  • Creates isolated venv at /opt/venv                       │
-│  • pip install -r requirements.txt                          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ COPY /opt/venv only
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Stage 2: runtime (python:3.12-alpine)                      │
-│  • No compiler toolchain — smaller attack surface           │
-│  • Non-root user `vanguard` (UID 10001)                     │
-│  • tini as PID 1 for proper signal forwarding               │
-│  • HEALTHCHECK against /health                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Host (macOS / Linux / Windows + Docker Desktop)                            │
+│                                                                             │
+│  Published ports:                                                           │
+│    localhost:8080  → telemetry-daemon:8080  (health)                        │
+│    localhost:8000  → telemetry-daemon:8000  (Prometheus metrics)            │
+│    localhost:9090  → prometheus:9090        (Prometheus UI)                 │
+│    localhost:3000  → grafana:3000             (Grafana UI)                    │
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  Docker network: vanguard-net (bridge)                                │  │
+│  │                                                                       │  │
+│  │  ┌─────────────────┐    scrape :8000/5s    ┌─────────────────┐       │  │
+│  │  │ telemetry-daemon│ ─────────────────────► │   prometheus    │       │  │
+│  │  │  :8080 health   │                        │     :9090       │       │  │
+│  │  │  :8000 metrics  │                        └────────┬────────┘       │  │
+│  │  └─────────────────┘                                 │ proxy           │  │
+│  │                                                      ▼                 │  │
+│  │                                             ┌─────────────────┐       │  │
+│  │                                             │    grafana      │       │  │
+│  │                                             │     :3000       │       │  │
+│  │                                             └─────────────────┘       │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why this works across macOS, Windows, and Linux
+### Service dependency chain
 
-1. **Alpine Linux base** — The container always runs Linux userspace regardless of host OS. Docker Desktop on macOS/Windows transparently handles architecture translation (ARM64 ↔ amd64) when using `--platform` or buildx.
-2. **Multi-stage separation** — Build tools (~100 MB+) never ship in the final image, reducing size and startup time.
-3. **Virtualenv copy** — Dependencies are fully resolved at build time; the runtime stage has no network access requirement.
-4. **Non-root execution** — Follows container security best practices; compatible with restricted Kubernetes/OpenShift policies.
-5. **`tini` init** — Ensures SIGTERM from `docker stop` reaches the Python process for graceful shutdown.
+1. **telemetry-daemon** starts first; must pass health check on `:8080`.
+2. **prometheus** starts after daemon is healthy; scrapes internal DNS name `telemetry-daemon:8000`.
+3. **grafana** starts after Prometheus; datasource URL `http://prometheus:9090` resolves on `vanguard-net`.
+
+### Cross-platform compatibility
+
+- Uses standard Compose v2 syntax (`docker compose`) — works on Docker Desktop for macOS (Apple Silicon native ARM), Linux, and Windows.
+- No host-specific bind mounts beyond relative project paths.
+- Named volumes (`vanguard-prometheus-data`, `vanguard-grafana-data`) persist metrics and dashboard state across restarts.
+- Override ports via environment variables without editing compose file:
+
+```bash
+HOST_GRAFANA_PORT=3001 HOST_PROMETHEUS_PORT=9091 docker compose up -d
+```
 
 ---
 
-## Build and Run Instructions
+## Grafana Dashboard Panels
+
+The auto-provisioned **Vanguard Telemetry Monitor** dashboard (`uid: vanguard-telemetry`) includes:
+
+| Panel | Query | Purpose |
+|-------|-------|---------|
+| Vehicle Telemetry Frequency | `rate(vanguard_telemetry_emitted_total[1m])` | Real-time timeline of incoming packet rate |
+| Anomaly Breakdown | `sum by (anomaly_type) (vanguard_anomalies_detected_total)` | Donut chart of caught anomalies by type |
+| Simulated Memory Allocation | `vanguard_memory_usage_bytes` | Gauge with threshold coloring |
+| Anomaly Detection Rate | `increase(...[5m])` by type | Stacked bar timeline of anomaly events |
+| Total Telemetry Packets | `vanguard_telemetry_emitted_total` | Stat panel |
+| Total Anomalies Detected | `sum(vanguard_anomalies_detected_total)` | Stat panel |
+| Memory Utilization Timeline | `vanguard_memory_usage_bytes` | Line graph over time |
+
+Dashboard refresh: **5 seconds** (aligned with Prometheus scrape interval).
+
+---
+
+## Launch & Verification Guide
 
 ### Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (macOS / Windows) or Docker Engine (Linux)
-- Docker CLI v20.10+ recommended
+- Docker Desktop running (macOS/Windows) or Docker Engine (Linux)
+- Docker Compose v2 (`docker compose version`)
+- Ports **8080**, **8000**, **9090**, **3000** available on the host
 
-### Build the image
+### 1. Stop conflicting Phase 2 containers (if running)
+
+```bash
+./scripts/deploy-factory.sh --stop
+```
+
+### 2. Launch the full observability stack
 
 From the project root:
 
 ```bash
-docker build -t vanguard-telemetry-monitor:phase1 .
+docker compose up -d --build
 ```
 
-#### Apple Silicon (M1/M2/M3) — explicit platform (optional)
+Expected services:
+
+```
+telemetry-daemon   healthy
+prometheus         running
+grafana            running
+```
+
+Monitor startup:
 
 ```bash
-docker build --platform linux/amd64 -t vanguard-telemetry-monitor:phase1 .
-# or native ARM:
-docker build --platform linux/arm64 -t vanguard-telemetry-monitor:phase1 .
+docker compose ps
+docker compose logs -f telemetry-daemon
 ```
 
-### Run the container
+### 3. Verify metrics exposition
 
 ```bash
-docker run --rm \
-  --name vanguard-telemetry \
-  -p 8080:8080 \
-  vanguard-telemetry-monitor:phase1
+# Raw Prometheus metrics from daemon
+curl -s http://localhost:8000/metrics | grep vanguard_
+
+# Health endpoint (Phase 1/2)
+curl -s http://localhost:8080/health
 ```
 
-You should see continuous JSON telemetry logs on stdout and can verify health:
+- [ ] `vanguard_telemetry_emitted_total` counter is incrementing
+- [ ] `vanguard_anomalies_detected_total` appears with `anomaly_type` labels after anomalies fire
+- [ ] `vanguard_memory_usage_bytes` increases when memory-leak anomalies occur
+
+### 4. Verify Prometheus scraping
+
+Open **http://localhost:9090** → **Status → Targets**.
+
+- [ ] Target `vanguard-telemetry` shows **UP**
+- [ ] Last scrape ~5s ago
+- [ ] Endpoint `http://telemetry-daemon:8000/metrics`
+
+Query in Prometheus UI:
+
+```promql
+rate(vanguard_telemetry_emitted_total[1m])
+```
+
+### 5. Verify Grafana dashboard
+
+Open **http://localhost:3000**
+
+| Field | Value |
+|-------|-------|
+| Username | `admin` |
+| Password | `admin` |
+
+Navigate: **Dashboards → Vanguard → Vanguard Telemetry Monitor**
+
+- [ ] Telemetry frequency graph shows ~1 packet/sec (default interval)
+- [ ] Anomaly donut chart populates over time
+- [ ] Memory gauge reflects simulated leak buffer growth
+- [ ] Dashboard auto-refreshes every 5 seconds
+
+### 6. Optional — increase anomaly rate for faster demo
 
 ```bash
-curl http://localhost:8080/health
+ANOMALY_CPU_SPIKE_PROB=0.10 ANOMALY_MEMORY_LEAK_PROB=0.08 ANOMALY_CORRUPT_JSON_PROB=0.08 \
+  docker compose up -d --build telemetry-daemon
 ```
 
-### Run with custom configuration
+Watch panels update within 5–10 seconds.
+
+### 7. Tear down
 
 ```bash
-docker run --rm \
-  --name vanguard-telemetry \
-  -p 8080:8080 \
-  -e TELEMETRY_INTERVAL=0.5 \
-  -e ANOMALY_CPU_SPIKE_PROB=0.05 \
-  -e ANOMALY_MEMORY_LEAK_PROB=0.03 \
-  -e ANOMALY_CORRUPT_JSON_PROB=0.04 \
-  -e VEHICLE_IDS="FLEET-A,FLEET-B,FLEET-C" \
-  vanguard-telemetry-monitor:phase1
+# Stop containers (retain volumes)
+docker compose down
+
+# Stop and remove volumes (full reset)
+docker compose down -v
 ```
-
-### Environment variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `TELEMETRY_INTERVAL` | `1.0` | Seconds between telemetry emissions |
-| `VEHICLE_IDS` | `VH-001,...,VH-005` | Comma-separated fleet identifiers |
-| `ANOMALY_CPU_SPIKE_PROB` | `0.02` | Probability of CPU spike per tick |
-| `ANOMALY_MEMORY_LEAK_PROB` | `0.01` | Probability of memory leak per tick |
-| `ANOMALY_CORRUPT_JSON_PROB` | `0.015` | Probability of corrupt JSON per tick |
-| `CPU_SPIKE_DURATION` | `3.0` | Duration of CPU spike in seconds |
-| `CPU_SPIKE_THREADS` | `4` | Worker threads during CPU spike |
-| `MEMORY_LEAK_CHUNK_KB` | `512` | KB retained per memory leak event |
-| `HEALTH_PORT` | `8080` | HTTP health/metrics port |
-
-### Stop gracefully
-
-```bash
-docker stop vanguard-telemetry
-```
-
-The daemon handles `SIGTERM` and logs final statistics before exiting.
 
 ---
 
-## Verification Checklist
+## Environment Variables Reference
 
-- [ ] `docker build` completes without errors
-- [ ] Container starts and streams JSON telemetry to stdout
-- [ ] `curl http://localhost:8080/health` returns `{"status":"ok","stats":{...}}`
-- [ ] Occasional anomaly log lines appear (`anomaly_detected`)
-- [ ] `docker stop` triggers graceful shutdown (`daemon_stopped` log)
+| Variable | Default | Service | Description |
+|----------|---------|---------|-------------|
+| `HOST_HEALTH_PORT` | `8080` | compose | Host port for daemon health |
+| `HOST_METRICS_PORT` | `8000` | compose | Host port for Prometheus metrics |
+| `HOST_PROMETHEUS_PORT` | `9090` | compose | Host port for Prometheus UI |
+| `HOST_GRAFANA_PORT` | `3000` | compose | Host port for Grafana UI |
+| `GRAFANA_ADMIN_USER` | `admin` | grafana | Grafana login user |
+| `GRAFANA_ADMIN_PASSWORD` | `admin` | grafana | Grafana login password |
+| `TELEMETRY_INTERVAL` | `1.0` | telemetry-daemon | Seconds between emissions |
+| `ANOMALY_CPU_SPIKE_PROB` | `0.02` | telemetry-daemon | CPU spike probability |
+| `ANOMALY_MEMORY_LEAK_PROB` | `0.01` | telemetry-daemon | Memory leak probability |
+| `ANOMALY_CORRUPT_JSON_PROB` | `0.015` | telemetry-daemon | Corrupt JSON probability |
+| `METRICS_PORT` | `8000` | telemetry-daemon | In-container metrics port |
 
 ---
 
-## Next Steps (Phase 2+)
+## MacBook Pro Validation Checklist
 
-Phase 1 intentionally produces raw telemetry and anomalies. Subsequent phases will add log aggregation, metrics scraping, alerting rules, and dashboard visualization on top of this foundation.
+- [ ] `docker compose up -d --build` completes without errors on Apple Silicon
+- [ ] `curl localhost:8000/metrics | grep vanguard_telemetry_emitted_total` returns data
+- [ ] Prometheus target `telemetry-daemon:8000` is **UP** at http://localhost:9090/targets
+- [ ] Grafana loads at http://localhost:3000 with credentials `admin` / `admin`
+- [ ] **Vanguard Telemetry Monitor** dashboard shows live graphs within 15 seconds
+- [ ] Memory gauge increases after memory-leak anomalies (may take 1–2 minutes at default rates)
+- [ ] `docker compose down` cleanly stops all three services
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Port already allocated | Phase 2 container or other service on 8080/3000 | `./scripts/deploy-factory.sh --stop` or change `HOST_*_PORT` vars |
+| Prometheus target DOWN | Daemon not healthy yet | `docker compose logs telemetry-daemon`; wait for health check |
+| Empty Grafana panels | Prometheus not scraping yet | Confirm target UP; set time range to **Last 15 minutes** |
+| Dashboard not appearing | Provisioning path issue | `docker compose logs grafana \| grep provisioning` |
+| Metrics stale after rebuild | Old Prometheus volume | `docker compose down -v` and relaunch |
+
+---
+
+## Next Steps (Phase 4+)
+
+Future phases may add Alertmanager rules, Loki log aggregation, OpenTelemetry tracing, and integration with the Phase 2 `health-check.sh` automation layer for unified incident response.

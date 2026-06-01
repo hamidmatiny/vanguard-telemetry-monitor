@@ -1,4 +1,5 @@
-# Vanguard Telemetry Monitor — Phase 1 runtime dependencies
+# Vanguard Telemetry Monitor — runtime dependencies
 # Pin versions for reproducible builds across macOS, Windows, and Linux hosts.
 
 python-json-logger==3.2.1
+prometheus_client==0.21.1

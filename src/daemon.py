@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
+from prometheus_client import Counter, Gauge, start_http_server
 from pythonjsonlogger.json import JsonFormatter
 
 # ---------------------------------------------------------------------------
@@ -34,6 +35,27 @@ CPU_SPIKE_THREADS = int(os.getenv("CPU_SPIKE_THREADS", "4"))
 MEMORY_LEAK_CHUNK_KB = int(os.getenv("MEMORY_LEAK_CHUNK_KB", "512"))
 
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8080"))
+METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics
+# ---------------------------------------------------------------------------
+
+TELEMETRY_EMITTED = Counter(
+    "vanguard_telemetry_emitted_total",
+    "Total successful JSON telemetry packets emitted",
+)
+
+ANOMALIES_DETECTED = Counter(
+    "vanguard_anomalies_detected_total",
+    "Total production anomalies detected by type",
+    labelnames=("anomaly_type",),
+)
+
+MEMORY_USAGE_BYTES = Gauge(
+    "vanguard_memory_usage_bytes",
+    "Simulated memory consumption retained by the daemon process",
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,6 +90,16 @@ def _increment_stat(key: str) -> None:
             _stats["anomalies_total"] += 1
 
 
+def _record_anomaly(anomaly_type: str, stat_key: str) -> None:
+    _increment_stat(stat_key)
+    ANOMALIES_DETECTED.labels(anomaly_type=anomaly_type).inc()
+
+
+def update_memory_gauge() -> None:
+    simulated_bytes = sum(len(chunk) for chunk in _memory_leak_buffer)
+    MEMORY_USAGE_BYTES.set(simulated_bytes)
+
+
 # ---------------------------------------------------------------------------
 # Anomaly simulators
 # ---------------------------------------------------------------------------
@@ -81,7 +113,7 @@ def _cpu_spike_worker(stop: threading.Event) -> None:
 
 def trigger_cpu_spike() -> None:
     """Simulate a sudden multi-threaded CPU spike (~90% utilization)."""
-    _increment_stat("cpu_spikes")
+    _record_anomaly("cpu_spike", "cpu_spikes")
     logger.warning(
         "anomaly_detected",
         extra={"anomaly_type": "cpu_spike", "threads": CPU_SPIKE_THREADS},
@@ -105,7 +137,8 @@ def trigger_memory_leak() -> None:
     """Append retained bytes to simulate a gradual memory leak."""
     chunk = os.urandom(MEMORY_LEAK_CHUNK_KB * 1024)
     _memory_leak_buffer.append(chunk)
-    _increment_stat("memory_leaks")
+    _record_anomaly("memory_leak", "memory_leaks")
+    update_memory_gauge()
     logger.warning(
         "anomaly_detected",
         extra={
@@ -118,7 +151,7 @@ def trigger_memory_leak() -> None:
 
 def emit_corrupt_payload() -> None:
     """Write malformed JSON directly to stdout (bypasses the logger)."""
-    _increment_stat("corrupt_payloads")
+    _record_anomaly("corrupt_json", "corrupt_payloads")
     vehicle_id = random.choice(VEHICLE_IDS)
     corrupt_variants = [
         f'{{"vehicle_id": "{vehicle_id}", "timestamp": "{datetime.now(timezone.utc).isoformat()}", '
@@ -171,6 +204,7 @@ def maybe_trigger_anomaly() -> None:
 def emit_telemetry() -> None:
     record = build_telemetry_record()
     _increment_stat("telemetry_emitted")
+    TELEMETRY_EMITTED.inc()
     logger.info("telemetry", extra={"telemetry": record})
 
 
@@ -181,11 +215,14 @@ def telemetry_loop() -> None:
             "interval_seconds": INTERVAL_SECONDS,
             "vehicle_count": len(VEHICLE_IDS),
             "health_port": HEALTH_PORT,
+            "metrics_port": METRICS_PORT,
         },
     )
+    update_memory_gauge()
     while not _shutdown.is_set():
         emit_telemetry()
         maybe_trigger_anomaly()
+        update_memory_gauge()
         _shutdown.wait(timeout=INTERVAL_SECONDS)
 
 
@@ -235,6 +272,9 @@ def _handle_signal(signum: int, _frame: Any) -> None:
 def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    start_http_server(METRICS_PORT)
+    logger.info("metrics_server_listening", extra={"port": METRICS_PORT})
 
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
